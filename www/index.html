@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0a0a">
+  <title>Amadeus</title>
+  <link rel="stylesheet" href="style.css?v=2">
+</head>
+<body>
+
+  <!-- 全屏背景图 -->
+  <div id="bg"></div>
+
+  <!-- Live2D 全屏立绘（透明 canvas） -->
+  <div id="live2d-container"></div>
+
+  <!-- 顶部：动画 Logo + 设置 -->
+  <header id="top-bar">
+    <canvas id="logo-canvas"></canvas>
+    <div id="top-actions">
+      <button id="settings-btn" title="设置" aria-label="设置">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor" width="24" height="24">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" />
+        <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+      </svg>
+    </button>
+  </header>
+
+  <!-- 底部聊天窗（半透明 meswin 背景） -->
+  <div id="chat-panel">
+    <div id="messages"></div>
+    <!-- 回到底部按钮（消息区上翻时显示） -->
+    <button id="scroll-bottom-btn" class="hidden" title="回到底部" aria-label="回到底部">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="2" stroke="currentColor" width="18" height="18">
+        <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 5.25 7.5 7.5 7.5-7.5m-15 6 7.5 7.5 7.5-7.5" />
+      </svg>
+    </button>
+    <div id="input-area">
+      <input type="file" id="file-input" accept="image/*" hidden>
+      <!-- 图片预览（发图第 4 步，先留结构） -->
+      <div id="image-preview" class="hidden"></div>
+      <div id="input-row">
+        <button id="image-btn" title="发送图片" aria-label="发送图片">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="1.5" stroke="currentColor" width="18" height="18">
+            <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Z" />
+          </svg>
+        </button>
+        <textarea id="chat-input" rows="1" enterkeyhint="send"></textarea>
+        <!-- 动态光标（ring 精灵动画） -->
+        <canvas id="cursor-ring" class="hidden"></canvas>
+        <button id="send-btn" title="发送" aria-label="发送">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth="1.8" stroke="currentColor" width="18" height="18">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M6 12 3.269 3.125A59.769 59.769 0 0 1 21.485 12 59.768 59.768 0 0 1 3.27 20.875L5.999 12Zm0 0h7.5" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 引导 / 设置面板 -->
+  <div id="overlay" class="hidden">
+    <div class="panel panel-side">
+      <!-- 左侧菜单（桌面版同款排版） -->
+      <div class="panel-menu">
+        <h2 id="panel-title">设置</h2>
+        <nav class="panel-nav">
+          <button class="panel-tab active" data-tab="model">Chat模型</button>
+          <button class="panel-tab" data-tab="tts">语音输出</button>
+          <button class="panel-tab" data-tab="sessions">会话管理</button>
+          <button class="panel-tab" data-tab="general">通用设置</button>
+        </nav>
+        <div class="panel-menu-spacer"></div>
+        <button id="panel-close" class="btn ghost hidden">返回</button>
+      </div>
+
+      <!-- 右侧内容 -->
+      <div class="panel-body">
+        <!-- Tab 1: Chat模型 -->
+        <div class="tab-pane active" id="tab-model">
+          <!-- 供应商选择 -->
+          <div class="field">
+            <label class="field-label">模型供应商</label>
+            <div class="provider-tabs">
+              <button class="provider-tab active" data-provider="xiaomi">小米 MiMo</button>
+              <button class="provider-tab" data-provider="deepseek">DeepSeek</button>
+            </div>
+          </div>
+
+          <!-- API Key -->
+          <div class="field">
+            <label class="field-label" for="key-input">API Key</label>
+            <div class="key-row">
+              <input type="password" id="key-input" placeholder="粘贴你的 API Key" autocomplete="off" spellcheck="false">
+              <button id="key-eye" title="显示/隐藏" aria-label="显示/隐藏">👁</button>
+              <button id="key-clear" title="清空" aria-label="清空">✕</button>
+            </div>
+          </div>
+
+          <!-- 模型选择 -->
+          <div class="field">
+            <label class="field-label" for="model-select">模型</label>
+            <select id="model-select"></select>
+          </div>
+        </div>
+
+        <!-- Tab 2: 语音输出（红莉栖说话，阿里云克隆音色） -->
+        <div class="tab-pane" id="tab-tts">
+          <div class="field switch-row">
+            <span>语音输出</span>
+            <label class="switch">
+              <input type="checkbox" id="tts-toggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="field">
+            <label class="field-label" for="aliyun-key-input">阿里云 API Key</label>
+            <div class="key-row">
+              <input type="password" id="aliyun-key-input" placeholder="粘贴阿里云百炼 API Key" autocomplete="off" spellcheck="false">
+              <button id="aliyun-key-eye" title="显示/隐藏" aria-label="显示/隐藏">👁</button>
+              <button id="aliyun-key-clear" title="清空" aria-label="清空">✕</button>
+            </div>
+            <p class="field-hint">填好 Key 后首次开语音会自动复刻红莉栖音色</p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="tts-engine-select">模型</label>
+            <select id="tts-engine-select"></select>
+            <p class="field-hint">固定使用该模型：0.8 元/万字符，支持日语</p>
+            <p class="field-hint" id="cosyvoice-voice-hint">首次开语音自动复刻红莉栖音色</p>
+          </div>
+        </div>
+
+        <!-- Tab 3: 会话管理 -->
+        <div class="tab-pane" id="tab-sessions">
+          <div class="field">
+            <label class="field-label">当前会话</label>
+            <p class="sess-stat" id="sess-stat">0 条消息</p>
+            <div class="sess-actions">
+              <button id="sess-export" class="btn ghost">导出 TXT</button>
+              <button id="sess-compress" class="btn ghost">压缩上下文</button>
+              <button id="sess-clear" class="btn ghost danger">清空对话</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 5: 通用设置 -->
+        <div class="tab-pane" id="tab-general">
+          <div class="field switch-row">
+            <span>显示立绘</span>
+            <label class="switch">
+              <input type="checkbox" id="l2d-toggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="panel-actions">
+          <button id="panel-save" class="btn primary">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Live2D 依赖（本地化，离线可用）：Cubism Core 必须先于 pixi-live2d-display 加载 -->
+  <!-- process shim：pixi/pixi-live2d-display 的 UMD 构建内部引用 Node 的 process，浏览器需要兜底 -->
+  <script>window.process = window.process || { env: { NODE_ENV: "production" } };</script>
+  <script src="assets/vendor/live2dcubismcore.min.js"></script>
+  <script src="assets/vendor/pixi.min.js"></script>
+  <script src="assets/vendor/cubism4.min.js"></script>
+  <script src="app.js?v=3"></script>
+</body>
+</html>

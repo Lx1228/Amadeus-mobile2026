@@ -1,0 +1,16 @@
+{
+  "appId": "com.amadeus.mobile",
+  "appName": "Amadeus",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#0a0a0a"
+  },
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

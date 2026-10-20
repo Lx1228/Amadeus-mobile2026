@@ -1,0 +1,16 @@
+{
+  "name": "amadeus-mobile",
+  "version": "1.0.0",
+  "description": "牧濑红莉栖数字伴侣手机版",
+  "private": true,
+  "scripts": {
+    "serve": "python serve.py 8931",
+    "android:sync": "npx cap sync android",
+    "android:build": "npx cap open android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/cli": "^8.5.0",
+    "@capacitor/core": "^8.5.0"
+  }
+}

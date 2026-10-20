@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Amadeus 音色样本托管</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:#14161a; color:#e8eaed; padding:24px; }
+  .card { max-width:440px; width:100%; background:#1c1f25; border:1px solid #2a2f38;
+          border-radius:12px; padding:22px; }
+  h1 { font-size:16px; margin:0 0 6px; }
+  p { font-size:13px; color:#9aa1ab; line-height:1.6; margin:0 0 14px; }
+  code { background:#12141a; padding:2px 6px; border-radius:4px; font-size:12px; color:#7fb2ff; }
+  audio { width:100%; margin:10px 0 6px; }
+  a { color:#7fb2ff; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Amadeus 音色样本托管</h1>
+  <p>这个页面只做一件事：提供一个稳定可公网访问的 <code>voice_sample.mp3</code>，供阿里云百炼声音复刻接口下载。</p>
+  <audio controls src="./voice_sample.mp3"></audio>
+  <p><a href="./voice_sample.mp3" download>下载 voice_sample.mp3</a></p>
+  <p>复刻接口用的完整地址就是本页地址 + <code>voice_sample.mp3</code>。</p>
+</div>
+</body>
+</html>
