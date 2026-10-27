@@ -80,9 +80,17 @@ cd android && ./gradlew assembleDebug
 
 ## 声明
 
-- 本项目为同人作品，与《命运石之门》版权方无任何关联
-- `assets/live2d/kurisu/` 中的 Live2D 模型为第三方作品，版权归原作者所有，仅供学习交流，请勿商用
-- 音色复刻请仅用于你拥有合法使用权的声音
+- 本项目为非官方同人作品，与《命运石之门》版权方无任何关联，未获任何授权
+- 项目内 Live2D 模型、音色样本等素材均来自网络，版权归原作者所有，本人不主张任何权利
+- 仅供个人学习交流，禁止商用、二次分发或单独提取素材
+- 如有版权问题请联系删除，本人不承担使用本项目产生的任何责任
+
+## 致谢
+
+- 红莉栖 Live2D 模型来自开源社区，感谢原作者
+- 技术依赖：[Capacitor](https://capacitorjs.com)、[PIXI](https://pixijs.com)、[pixi-live2d-display](https://github.com/guansss/pixi-live2d-display)、[Live2D Cubism SDK](https://www.live2d.com/sdk/cubism/)
+- 云服务：小米 MiMo、DeepSeek、阿里云百炼
+- 反馈与交流：QQ 群 **1046949762**
 
 ## License
 
