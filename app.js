@@ -108,21 +108,124 @@ const BASE_SCALE = 0.3;
 
 // ================= 工具函数 =================
 
-/** 从 LLM 原始回复中提取显示文本（只留中文部分，去情绪标签和日语段） */
-function displayText(raw) {
-  let t = String(raw || "");
-  // 去掉所有 [emotion:xxx] 标签（模型偶尔在中间段落也加标签，全部隐藏）
-  t = t.replace(/\[emotion:[^\]]*\]/g, "");
-  // 兼容各种 === 分隔变体（\n===\n / ===\n / === 前无换行等）：取 === 之前的中文部分
-  const idx = t.indexOf("===");
-  if (idx !== -1) t = t.substring(0, idx);
-  return t.trim();
+/** 某一行里假名的"密度"（用来判断这行是不是日语） */
+function lineKanaRatio(line) {
+  const s = String(line || "");
+  const kana = (s.match(/[\u3040-\u30ff]/g) || []).length;
+  // 去掉空白、数字和常见标点后的有效字符数
+  const meaningful = s.replace(/[\s0-9。、！？!?.,，…—\-~〜（）()「」『』【】:：;；"'“”‘’]/g, "").length;
+  return { kana, meaningful, ratio: meaningful ? kana / meaningful : 0 };
 }
 
-/** 从原始回复中提取情绪标签 */
+/**
+ * 智能切分"中文 / 日语"（2026-10-27）。
+ *
+ * 模型偶尔不输出 ===，而是把日语用括号直接跟在中文后面（同一段或下一行）：
+ *   （愣住，声音微颤）……你、你这结果根本不对吧，笨蛋……
+ *   （声を震わせて）……えっ、ちょっと、その結果、明らかに間違ってるじゃない。
+ * 旧逻辑只认 ===，于是①整段中日混排全显示出来 ②没有日语可念 ③情绪标签也没了。
+ *
+ * 三级兜底：① 标准 === 分隔 → ② 按行找"假名密度突变" → ③ 单行内找连续假名块。
+ */
+function splitBilingual(raw) {
+  const t = String(raw || "").replace(/\[emotion:[^\]]*\]?/g, "").trim();
+  if (!t) return { zh: "", ja: "" };
+
+  // ① 标准 === 分隔
+  const idx = t.indexOf("===");
+  if (idx !== -1) {
+    const zh = t.slice(0, idx).trim();
+    const ja = t.slice(idx + 3).trim();
+    if (ja) return { zh, ja };
+  }
+
+  // ② 按行切：找到第一行"假名密度高"的行，之前的算中文、之后的算日语
+  const lines = t.split(/\n/);
+  for (let i = 1; i < lines.length; i++) {
+    const { kana, meaningful, ratio } = lineKanaRatio(lines[i]);
+    if (meaningful >= 5 && kana >= 3 && ratio > 0.2) {
+      return { zh: lines.slice(0, i).join("\n").trim(), ja: lines.slice(i).join("\n").trim() };
+    }
+  }
+
+  // ③ 单行混排：从第一个"连续 2 个以上假名"处切开，并回退到最近的标点边界
+  const m = t.match(/[\u3040-\u30ff]{2,}/);
+  if (m && m.index > 10) {
+    let cut = m.index;
+    const head = t.slice(0, cut);
+    const lastPunct = Math.max(
+      head.lastIndexOf("。"), head.lastIndexOf("！"), head.lastIndexOf("？"),
+      head.lastIndexOf("…"), head.lastIndexOf("\n"),
+      head.lastIndexOf("）"), head.lastIndexOf(")")
+    );
+    if (lastPunct > 0 && lastPunct > cut - 40) cut = lastPunct + 1;
+    const zh = t.slice(0, cut).trim();
+    const ja = t.slice(cut).trim();
+    if (zh && ja && JA_KANA_RE.test(ja)) return { zh, ja };
+  }
+
+  return { zh: t, ja: "" };
+}
+
+/** 从 LLM 原始回复中提取显示文本（只留中文部分，去情绪标签和日语段） */
+function displayText(raw) {
+  return splitBilingual(raw).zh;
+}
+
+/**
+ * 关闭深度思考（2026-10-27 提速关键）。
+ * 小米 MiMo v2.6 系列（mimo-v2.6-flash / pro / pro-ultraspeed）**默认开启深度思考**：
+ * 流式响应先返回一大段 reasoning_content（思考过程），思考完才输出 content。
+ * 手机端只渲染 content，用户感知就是"点了发送后卡好几秒才开始出字"。
+ * 闲聊不需要思维链，显式关掉；其他供应商（DeepSeek 等）不认这个字段，不传即可。
+ */
+function noThinking(cfg) {
+  return cfg && cfg.provider === "xiaomi" ? { thinking: { type: "disabled" } } : {};
+}
+
+/** 从原始回复中提取情绪标签
+ *  2026-10-27：旧正则锚定开头 `^\[emotion:`，模型只要在标签前多打一个换行/空格就匹配不到
+ *  → 情绪永远是 neutral → 语音永远不传指令 → 听感平淡。现在去掉锚点、允许空白、忽略大小写。 */
 function emotionOf(raw) {
-  const m = String(raw || "").match(/^\[emotion:(neutral|blush|angry|smile|sad)\]/);
-  return m ? m[1] : "neutral";
+  const m = String(raw || "").match(/\[emotion:\s*(neutral|blush|angry|smile|sad)\s*\]/i);
+  return m ? m[1].toLowerCase() : "neutral";
+}
+
+/**
+ * 推断情绪（2026-10-27）：标签优先，没有标签时**从文字内容推断**。
+ *
+ * 为什么需要：关掉深度思考后（提速），模型输出格式的遵守度会下降，经常不给 [emotion:xxx] 标签
+ * → 表情完全不动、语音也没有语气。用户反馈"老版本会根据文字内容触发表情"，说的就是这个需求。
+ *
+ * 推断依据（按可靠度排序）：
+ *   1. 模型给的 [emotion:xxx] 标签（最准）
+ *   2. 动作括号里的描述 ——（脸红）（别过脸）（轻笑）（叹气）这类在人设里是被要求写的，最可靠
+ *   3. 正文里的语气词/口癖 —— 红莉栖的"笨蛋""别误会""哼"之类
+ */
+function inferEmotion(raw) {
+  const tagged = emotionOf(raw);
+  if (tagged !== "neutral") return tagged; // 有标签就用标签
+
+  const rawStr = String(raw || "");
+  // 只要出现过 [emotion:neutral] 这种显式标签，就尊重模型给的 neutral
+  if (/\[emotion:\s*neutral\s*\]/i.test(rawStr)) return "neutral";
+
+  const text = displayText(raw);
+  const actions = (text.match(/（[^）]{0,40}）|\([^)]{0,40}\)/g) || []).join("");
+
+  // ① 动作括号（人设要求写，语义明确）
+  if (/脸红|害羞|别过脸|移开视线|声音变小|声音微颤|低下头|慌乱|心跳|磕巴|结巴/.test(actions)) return "blush";
+  if (/笑|眯|扬唇|弯眼|咧嘴/.test(actions)) return "smile";
+  if (/叹|沉默|垂眼|低落|失落|闷|摇头/.test(actions)) return "sad";
+  if (/皱眉|瞪|抱臂|皱眉|咬牙|冷哼|扶额/.test(actions)) return "angry";
+
+  // ② 正文语气（红莉栖的标志性表达）
+  if (/笨蛋|蠢|烦|搞什么|你有病|喂[，！]|哼[！。]|说什么呢/.test(text)) return "angry";
+  if (/太好了|真棒|不错嘛|有意思|有趣|总算/.test(text)) return "smile";
+  if (/对不起|抱歉|没办法|算了|无所谓|随便你/.test(text)) return "sad";
+  if (/别误会|才不是|不是说过|谁要|才没有/.test(text)) return "blush";
+
+  return "neutral";
 }
 
 /**
@@ -146,23 +249,27 @@ function filterJapanese(text) {
   return kept.trim();
 }
 
-/** 从原始回复中提取 TTS 语音文本（日语段，克隆音色是日语配音；无日语段则用中文） */
+/**
+ * 从原始回复中提取 TTS 文本 + 该用什么语言念。返回 { text, lang }，lang 为 "ja" | "zh"。
+ *
+ * 2026-10-26 修复「奇怪口音的中文」：
+ * 旧逻辑纯中文时回落到中文文本，但合成固定 language_hints=["ja"] →
+ * CosyVoice 拿日语发音规则念汉字，听起来像"日本人读中文"。
+ * 电脑版（Amadeus/src/lib/message-parser.ts）的做法是纯中文直接跳过 TTS；
+ * 手机版改成按文本实际语种切换发音规则 —— 既不出怪口音，也不会整条静音。
+ */
 function getTTSText(raw) {
-  const t = String(raw || "").replace(/^\[emotion:[^\]]*\]/, "").trim();
-  // 兼容各种 === 分隔变体：取第一个 === 之后的内容作为日语段
-  const idx = t.indexOf("===");
-  if (idx !== -1) {
-    const ja = t.substring(idx + 3).replace(/^[\s\n]+/, "").trim();
-    if (ja) {
-      const filtered = filterJapanese(ja);
-      if (filtered) return filtered; // 有真日语 → 用过滤后的日语段
-    }
+  const { zh, ja } = splitBilingual(raw);
+  // 有独立日语段（=== 或智能切分出来的）→ 用它，过滤掉混进来的中文句
+  if (ja) {
+    const filtered = filterJapanese(ja);
+    if (filtered) return { text: filtered, lang: "ja" };
   }
-  // === 后无有效日语：中文兜底。但模型格式乱时 === 前中文段里也可能混日语 → 优先念其中的日语片段
-  const zh = displayText(raw);
+  // 中文段里可能夹着日语片段（格式乱时）→ 优先念其中的日语
   const zhFiltered = filterJapanese(zh);
-  if (zhFiltered) return zhFiltered;
-  return zh; // 纯中文 → 中文兜底（Japanese 模式念，与桌面端一致）
+  if (zhFiltered) return { text: zhFiltered, lang: "ja" };
+  // 纯中文：用中文发音规则念，不再用日语腔硬念
+  return { text: zh, lang: "zh" };
 }
 
 /** 获取当前时间上下文（桌面版 route.ts 同款格式） */
@@ -229,19 +336,38 @@ let liveReady = false;
 const EXTRA_DOWN = 0.10;
 
 /**
- * 底部锚定定位（核心稳定性修复）：
- * 模型位置不再依赖"中心点放屏高 62%"的估算（重开 App 时 WebView 初始高度时序
- * 不同会导致中心定位漂移、底边悬空），而是用模型真实包围盒让底边稳定贴住屏幕底。
- * 调用时机：初始加载、模型 ready、resize —— 结果与加载时机完全无关。
+ * 底部锚定定位（固定锚点版，2026-10-26 定稿）：
+ *
+ * 历史上两个版本都漂过：
+ *  v1 `m.y = 目标底边 - bounds.height/2` —— 假设"包围盒中心==锚点"，姿态一变就算偏；
+ *  v2 增量修正 `m.y += 目标底边 - bounds.bottom` —— 仍然每次基于**当前姿态**的包围盒：
+ *      待机动作把手脚展开 → 包围盒底边变低 → 模型被上移；动作结束包围盒缩回 → 人物悬空偏上。
+ *      （用户实测截图：立绘偶尔整体偏高、脚不贴底）
+ *
+ * 定稿方案：在**静置状态**下测一次「包围盒底边 / 水平中心」相对 model.x/y 的偏移（锚点偏移），
+ * 之后定位只做减法，与运行时包围盒彻底解耦 —— 动作 / 呼吸 / 情绪再怎么改变包围盒，站位纹丝不动。
+ * 只有两种情况重测：① 尚未测过；② scale 变了（偏移随缩放变化，如旋转屏幕）。
+ * 重测只在加载校准（静置窗口期，待机动作 2s 后才启动）和 resize 时发生。
  */
-function positionModel(m) {
+let l2dAnchor = null; // { bottom, centerX, scale } —— 锚点偏移缓存
+
+function positionModel(m, remeasure) {
   if (!liveApp || !m) return;
   try {
-    const bounds = m.getBounds();
-    if (!bounds || bounds.height < 1) return; // 模型未就绪，跳过（ready 后再校准）
-    const h = liveApp.screen.height;
-    m.y = h * (1 + EXTRA_DOWN) - bounds.height / 2; // 底边下移超屏，视觉下沿被聊天窗盖住，不留白
-    m.x = liveApp.screen.width / 2;
+    const needMeasure = remeasure || !l2dAnchor || Math.abs(m.scale.x - l2dAnchor.scale) > 1e-9;
+    if (needMeasure) {
+      const b = m.getBounds();
+      if (!b || b.height < 1) return; // 模型未就绪，跳过（ready 后再校准）
+      l2dAnchor = {
+        bottom: b.y + b.height - m.y, // 包围盒底边相对锚点的垂直偏移
+        centerX: b.x + b.width / 2 - m.x, // 包围盒水平中心相对锚点的水平偏移
+        scale: m.scale.x,
+      };
+    }
+    const sw = liveApp.screen.width;
+    const sh = liveApp.screen.height;
+    m.y = sh * (1 + EXTRA_DOWN) - l2dAnchor.bottom;
+    m.x = sw / 2 - l2dAnchor.centerX;
   } catch (e) {
     console.warn("[Live2D] positionModel 失败:", e);
   }
@@ -331,11 +457,12 @@ async function initLive2D(container) {
   //（≈ 相对之前观感缩小 10%）；配合 positionModel 底部下移，头部自然回到屏内不突出。
   const SCALE_REDUCE = 0.85;
   let modelBaseH = 0; // 模型原始 bounds 高度（多帧校准用，取 max 收敛稳定）
-  const applyModelSize = () => {
+  const applyModelSize = (remeasure) => {
     const hh = liveApp.screen.height;
     const s = (BASE_SCALE * (hh / BASE_HEIGHT)) * 1.0 * SCALE_REDUCE;
     liveModel.scale.set(s);
-    positionModel(liveModel); // 底部锚定（与加载时机无关，彻底稳定）
+    positionModel(liveModel, remeasure); // 固定锚点定位；scale 变化时内部自动重测锚点
+    // 注：定位时机由「模型首帧渲染后」那一次精确定位负责，这里不再做任何延时重测
   };
   model.x = app.screen.width / 2;
   // 缓存模型原始高度（取历史最大值：模型包围盒随 motion/纹理异步加载只会变大，
@@ -353,29 +480,31 @@ async function initLive2D(container) {
   hideLive2DLoading();
   console.log(`[Live2D] 模型加载成功 ${LIVE2D_MODEL} scale=${liveModel.scale.x.toFixed(3)} baseH=${Math.round(modelBaseH)}`);
 
-  // 多帧 + 延时校准兜底：motion/纹理异步加载完成后 bounds 才稳定，
-  // 期间反复用真实包围盒刷新 modelBaseH（取 max）+ 重新缩放定位（含顶部保护）。
-  const recalibrate = () => {
+  // 【2026-10-27 定位：一次量准】模型在第一帧渲染之前，getBounds() 拿到的是尚未定稿的
+  // 包围盒（所以早期用固定延时/等"稳定"都会量错，人物偏高）。正确时机是**渲染两帧之后**：
+  // 那时 coreModel 已 update，包围盒就是真实绘制区域，量一次即为准，之后永久锁定。
+  // 只用一次 rAF 双帧（约 32ms），不做任何后续校正。
+  requestAnimationFrame(() => requestAnimationFrame(() => {
     try {
-      const b = liveModel.getBounds();
+      // 同一帧内先把渲染器尺寸对齐当前视口（WebView 首次布局可能晚于 PIXI 初始化，
+      // 若尺寸不一致就直接在这里纠正，不留给后续补丁）
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      if (Math.abs(liveApp.screen.width - vw) > 2 || Math.abs(liveApp.screen.height - vh) > 2) {
+        liveApp.renderer.resize(vw, vh);
+        container.style.width = vw + "px";
+        container.style.height = vh + "px";
+        liveApp.stage.hitArea = liveApp.screen;
+      }
+      const b = liveModel && liveModel.getBounds();
       if (b && b.height > 1) {
         const h0 = b.height / liveModel.scale.x;
-        if (h0 > modelBaseH) modelBaseH = h0; // 取最大，收敛到稳定值
-        applyModelSize();
+        if (h0 > modelBaseH) modelBaseH = h0;
       }
+      applyModelSize(true); // 重测锚点并定位（唯一一次精确定位）
+      console.log("[Live2D] 首帧渲染后完成定位");
     } catch (e) { /* 忽略 */ }
-  };
-  // 第 1 次：300ms（纹理基本解码完）
-  setTimeout(() => {
-    recalibrate();
-    // 第 2/3 次：rAF 后下一帧连续校准两次
-    requestAnimationFrame(() => {
-      recalibrate();
-      requestAnimationFrame(recalibrate);
-    });
-    // 第 4 次：1.5s 保险（防 motion 异步加载完成后 bounds 才稳定）
-    setTimeout(recalibrate, 1500);
-  }, 300);
+  }));
 
   // ---- 触摸/鼠标跟随：点哪看哪（PIXI 统一指针事件，触摸也走这里） ----
   app.stage.eventMode = "static";
@@ -480,7 +609,6 @@ async function initLive2D(container) {
   // 阈值法会被中间态绕过导致模型误缩放 —— 宽度判据对此完全免疫）。
   let lastInnerW = window.innerWidth;
   let lastInnerH = window.innerHeight;
-  let calibTimer = null;
   const syncL2D = (w2, h2) => {
     liveApp.renderer.resize(w2, h2);
     container.style.width = w2 + "px";   // 真窗口变化（旋转/拖拽）时同步容器
@@ -495,22 +623,22 @@ async function initLive2D(container) {
     if (!liveApp || !liveModel) return;
     const w = window.innerWidth, h = window.innerHeight;
     if (Math.abs(w - lastInnerW) <= 2) {
-      // 宽度不变（±2px 容差：真机键盘弹出可能伴随 1px 宽度抖动）= 键盘弹起/收回（或状态栏切换），立绘作为背景不动
-      if (h > lastInnerH + 50) {
-        // 键盘收回（高度恢复）：等 resize 风暴平息后校准一次，模型贴底恢复
-        clearTimeout(calibTimer);
-        calibTimer = setTimeout(() => syncL2D(w, h), 400);
-      }
-      // 高度减小 = 键盘弹出：完全不碰立绘
+      // 宽度不变（±2px 容差）= 键盘弹起/收起 或 状态栏高度变化。
+      // 【2026-10-27】这里以前在"键盘收起"后 400ms 又 syncL2D 了一次 —— 那会把已经定好的
+      // 位置重新算一遍，用户看到的就是"点输入框→人物位置跳了"。位置一旦锁定就不该再动，
+      // 所以现在键盘相关的 resize 一律不碰立绘。
       lastInnerH = h;
       lastInnerW = w;
       return;
     }
-    // 宽度变化（>2px）= 旋转 / 窗口拖拽：立即同步
+    // 宽度变化（>2px）= 旋转 / 窗口拖拽：这种真窗口变化才重新布局
     lastInnerW = w;
     lastInnerH = h;
     syncL2D(w, h);
   });
+
+  // 定位只在「模型首帧渲染后」和「屏幕旋转」两个时机发生，不再做启动后的延时校正
+  //（延时校正属于"先摆错再改对"的补丁，已在首帧定位里一次量准，故删除）。
 }
 
 /** 触发 Live2D 情绪（文字回复到达时调用） */
@@ -1255,6 +1383,7 @@ async function compressContext() {
         model: cfg.model,
         messages: [{ role: "user", content: COMPRESS_PROMPT + dialogText }],
         max_tokens: 512,
+        ...noThinking(cfg),
       }),
     });
     const data = await res.json();
@@ -1306,8 +1435,31 @@ function saveMemories(memories) {
   } catch { /* 忽略 */ }
 }
 
-const EXTRACT_PROMPT = `从下面的对话中提取关于用户的长期记忆（事实、偏好、重要信息），
-每条以 "- [记忆] 内容" 格式输出，一行一条。如果没有任何值得记住的，输出空。
+// 提取 prompt：对齐电脑版（amadeus/src/lib/memory.ts）。旧版只有一句话，
+// 分不清"长期有效"和"瞬时状态"，会把"在吃饭""今天下雨"这类垃圾也记进去，
+// 记忆库很快被琐事塞满 → 真正重要的身份信息反而被挤掉。
+const EXTRACT_PROMPT = `分析以下对话，提取需要长期记住的关键信息。
+
+【只提取长期有效的事实，不要提取瞬时状态】
+要提取的：
+- 用户的固定信息：名字、职业、家乡、生日、性格特点
+- 长期偏好：喜欢的食物/音乐/游戏/作者、固定的习惯（如每天跑步）
+- 重要关系：家庭成员、宠物、长期朋友
+- 重大事件：毕业、换工作、搬家（这些是已发生的人生节点）
+
+不要提取的（瞬时/过时即弃）：
+- 正在做的临时动作：在吃饭、在睡觉、在上班、在打游戏、在看剧
+- 当前时间相关：今天/昨晚/刚才做了什么、几点了、现在心情如何
+- 还未发生的事：准备去吃、待会要做什么、明天计划
+- 寒暄/闲聊：你好、晚安、在吗、吃饭了吗
+
+判断标准：这条信息一周后还有意义吗？没有就别提取。
+
+格式要求（每条一行）：
+- [事实] 长期有效的用户信息或偏好
+- [情感] 用户表现出的稳定性格倾向（不是当下情绪）
+
+如果没有值得记住的内容，返回空。
 
 对话：
 `;
@@ -1332,6 +1484,7 @@ async function extractMemories() {
         model: cfg.model,
         messages: [{ role: "user", content: prompt }],
         max_tokens: 512,
+        ...noThinking(cfg),
       }),
     });
     const data = await res.json();
@@ -1353,7 +1506,7 @@ async function extractMemories() {
         }
       }
       if (added.length > 0) {
-        saveMemories([...all, ...added].slice(-100)); // 最多 100 条
+        saveMemoriesCapped([...all, ...added]); // 按类型限流：事实不会挤掉场景/印象
         console.log(`[Memory] L1 新增 ${added.length} 条事实`);
       }
     }
@@ -1399,6 +1552,7 @@ async function distillMemories() {
         model: cfg.model,
         messages: [{ role: "user", content: DISTILL_PROMPT + factsText }],
         max_tokens: 512,
+        ...noThinking(cfg),
       }),
     });
     const data = await res.json();
@@ -1419,12 +1573,59 @@ async function distillMemories() {
     const scenarios = newHigh.filter((m) => m.type === "scenario").slice(-10);
     const personas = newHigh.filter((m) => m.type === "persona").slice(-3);
     if (scenarios.length || personas.length) {
-      saveMemories([...keepFacts, ...scenarios, ...personas].slice(-100));
-      console.log(`[Memory] 蒸馏完成: ${scenarios.length} 场景 / ${personas.length} 印象`);
+      // 旧高层记忆保留、新的追加在后面（超限时旧的自然被挤掉），
+      // 避免某次蒸馏结果不完整就把历史印象全部清空
+      saveMemoriesCapped([...keepFacts, ...existingHigh, ...scenarios, ...personas]);
+      console.log(`[Memory] 蒸馏完成: +${scenarios.length} 场景 / +${personas.length} 印象`);
     }
   } catch (e) {
     console.warn("[Memory] 蒸馏失败:", e);
   }
+}
+
+/** 事实记忆注入的字符预算（2026-10-27 从 1200 降到 800：记忆全量注入会拖慢首字） */
+const FACT_BUDGET_CHARS = 800;
+
+/**
+ * 挑选要注入 prompt 的事实记忆（对齐电脑版 2026-10-25 的修复）。
+ *
+ * 旧实现是 `facts.slice(-3)` —— 只发最近 3 条。聊得越久记忆攒得越多，
+ * 早期那条"我叫什么、什么职业"会被后来的琐事挤出去，表现就是"它不记得我了"。
+ *
+ * 现在的策略：全部注入（去重），只在超出字符预算时取舍 ——
+ * 保留最早的 30%（通常是身份类信息，最重要）+ 尽可能多的最新记忆。
+ */
+function selectFactsForPrompt(facts) {
+  const seen = new Set();
+  const list = [];
+  for (const m of facts) {
+    const c = String(m.content || "").trim();
+    if (!c || seen.has(c)) continue; // 同一条事实被反复提取很常见
+    seen.add(c);
+    list.push(c);
+  }
+  const cost = (arr) => arr.reduce((n, f) => n + f.length + 1, 0);
+  if (cost(list) <= FACT_BUDGET_CHARS) return list;
+
+  const headCount = Math.max(1, Math.floor(list.length * 0.3));
+  const head = list.slice(0, headCount);
+  let used = cost(head);
+  const tail = [];
+  for (let i = list.length - 1; i >= headCount; i--) {
+    const c = list[i].length + 1;
+    if (used + c > FACT_BUDGET_CHARS) break;
+    tail.unshift(list[i]);
+    used += c;
+  }
+  return [...head, ...tail];
+}
+
+/** 按类型分别限流保存：事实多了不会挤掉场景/印象（旧版 slice(-100) 会一起截） */
+function saveMemoriesCapped(memories) {
+  const facts = memories.filter((m) => m.type === "fact").slice(-200);
+  const scenarios = memories.filter((m) => m.type === "scenario").slice(-10);
+  const personas = memories.filter((m) => m.type === "persona").slice(-3);
+  saveMemories([...facts, ...scenarios, ...personas]);
 }
 
 /** 构建记忆上下文（分层注入：L3 印象 + L2 场景优先，细节带 L1 事实） */
@@ -1433,12 +1634,13 @@ function buildMemoryContext() {
   if (memories.length === 0) return "";
   const personas = memories.filter((m) => m.type === "persona").slice(-2);
   const scenarios = memories.filter((m) => m.type === "scenario").slice(-3);
-  const facts = memories.filter((m) => m.type === "fact").slice(-3); // 最近细节
+  // 事实：全部去重 + 预算取舍（不再只取最近 3 条，否则"我是谁"会被挤掉）
+  const facts = selectFactsForPrompt(memories.filter((m) => m.type === "fact"));
 
   const parts = [];
   if (personas.length > 0) parts.push("长期印象：" + personas.map((m) => m.content).join("；"));
   if (scenarios.length > 0) parts.push("过往场景：" + scenarios.map((m) => m.content).join("；"));
-  if (facts.length > 0) parts.push("事实：" + facts.map((m) => m.content).join("；"));
+  if (facts.length > 0) parts.push("事实：" + facts.join("；"));
 
   if (parts.length === 0) return "";
   return "\n\n【记忆数据】以下是关于用户的长期信息（过去积累的事实，不是现在正在发生的事。当前时间见下方【当前时间】，判断是否过时）：\n" + parts.join("\n") + "\n";
@@ -1455,21 +1657,65 @@ function updateSessStat() {
 // 内存会话历史（第 5 步接入 localStorage 持久化）
 let conversation = [];
 let personalityCache = null;
+let personalityState = "pending"; // pending | ok | failed
 
 /** 加载红莉栖人设（kurisu-personality.txt，带缓存） */
 async function loadPersonality() {
   if (personalityCache !== null) return personalityCache;
   try {
-    const res = await fetch(PERSONALITY_FILE);
-    if (res.ok) personalityCache = await res.text();
-    else personalityCache = "";
-  } catch {
+    const res = await fetch(PERSONALITY_FILE, { cache: "no-store" });
+    if (res.ok) {
+      personalityCache = await res.text();
+      personalityState = personalityCache.trim() ? "ok" : "failed";
+    } else {
+      personalityCache = "";
+      personalityState = "failed";
+    }
+  } catch (e) {
+    console.warn("[人设] 加载失败:", e);
     personalityCache = "";
+    personalityState = "failed";
   }
+  console.log(`[人设] ${personalityState}，${personalityCache.length} 字符`);
+  updatePersonalityStatus();
   return personalityCache;
 }
 
-/** 构建 system 提示词：人设 + 记忆上下文 + 当前时间上下文 */
+/** 设置面板：显示人设加载状态（排查"模型不听人设/不说日语"用） */
+function updatePersonalityStatus() {
+  const el = document.getElementById("personality-status");
+  if (!el) return;
+  if (personalityState === "ok") {
+    el.textContent = `人设：已加载 ${personalityCache.length} 字符`;
+    el.style.color = "";
+  } else if (personalityState === "failed") {
+    el.textContent = "人设：加载失败 —— 模型不知道要输出双语格式，语音只会说中文";
+    el.style.color = "#E2685C";
+  }
+}
+
+/**
+ * 输出格式硬约束：独立于人设文件，固定拼在 system 末尾。
+ * LLM 对 system 末尾的指令遵循度最高；而且即使人设文件加载失败，
+ * 这条仍在，不至于让模型完全不知道要输出双语格式（2026-10-26 加）。
+ */
+const FORMAT_RULES = `
+
+【输出格式 · 最高优先级，不可省略】
+每条回复必须严格分成两段，用独占一行的 === 分隔：
+
+[emotion:情绪]中文内容
+===
+日本語内容
+
+硬性要求：
+1. 第一段是中文，给用户看；第二段是日语，给语音合成念
+2. 第二段必须是真日语：必须有假名（助词、词尾、送假名），汉字用日文汉字
+3. 严禁把第一段的中文原样复制到 === 下面 —— 没有假名的句子不是日语，语音会念成怪腔调
+4. 即使只回一个"嗯"，也要按这个两段格式输出
+5. 第二段之后不要再写任何中文`;
+
+/** 构建 system 提示词：人设 + 记忆上下文 + 当前时间上下文 + 格式硬约束（末尾） */
 function buildSystemPrompt() {
   // 对话摘要（压缩产生）：从 conversation 里提取，注入 system，不占 history
   let summaryContext = "";
@@ -1477,7 +1723,7 @@ function buildSystemPrompt() {
   if (summaryMsg && summaryMsg.content) {
     summaryContext = "\n\n【之前的对话摘要】" + summaryMsg.content + "\n（以下是最近的对话，请基于上述摘要保持上下文连贯）";
   }
-  return (personalityCache || "") + buildMemoryContext() + summaryContext + "\n\n" + nowContext();
+  return (personalityCache || "") + buildMemoryContext() + summaryContext + "\n\n" + nowContext() + FORMAT_RULES;
 }
 
 /** 历史消息 → LLM messages（最近 10 条）
@@ -1485,34 +1731,55 @@ function buildSystemPrompt() {
  * 双语原文每条很长，全发会让请求体越来越大、回复越来越慢。
  * 日语段只给语音输出用，LLM 上下文不需要，人设已要求输出双语格式。
  * 图片消息只发文字标记，不重发 base64。 */
+/** 双语消息的智能截断：超长时中文段和日语段各留一部分，绝不能把 === 之后的日语整段切掉 */
+function clampBilingual(s, max) {
+  const str = String(s || "");
+  if (!str || str.length <= max) return str;
+  const i = str.indexOf("===");
+  if (i === -1) return str.slice(0, max);
+  const zh = str.slice(0, i);
+  const ja = str.slice(i);
+  const budget = max - 4;
+  const zhKeep = Math.min(zh.length, Math.floor(budget * 0.5));
+  const zhPart = zh.slice(0, zhKeep);
+  const jaPart = ja.slice(0, budget - zhKeep);
+  return zhPart + jaPart;
+}
+
 function buildHistory() {
-  // 摘要消息已注入 system，不再作为历史发送
-  const recent = conversation.filter((m) => !m.summary).slice(-10);
-  return recent.map((m) => {
-    // 每条截断 500 字符：长消息（如语音测试的双语长文本）会让请求体膨胀、首字变慢；
-    // 历史只是辅助上下文，截断不影响对话质量（与压缩时的截断一致）
-    const clamp = (s) => (s && s.length > 500 ? s.slice(0, 500) : s);
+  // 【2026-10-27 提速】10 条 × 1200 字符的完整双语 ≈ 上万字符（日语还特别吃 token），
+  // 首字延迟明显变长，用户反馈"回消息慢好多"。
+  // 现在改成：最近 4 条保留完整双语（格式示范够了）+ 更早的只发中文（省 token），条数降到 8。
+  const recent = conversation.filter((m) => !m.summary).slice(-8);
+  const KEEP_BILINGUAL = 4;
+  return recent.map((m, idx) => {
+    const isRecent = idx >= recent.length - KEEP_BILINGUAL;
+    const clamp = (s, n) => (s && s.length > n ? s.slice(0, n) : s);
     if (m.role === "assistant") {
-      // 只发中文，且把多行合并成一行：防止模型模仿历史里的"两行/两段"格式（自我强化循环）
-      const zh = displayText(m.content).replace(/\s*\n+\s*/g, " ");
-      return { role: m.role, content: clamp(zh) || "（无内容）" };
+      // 【2026-10-27】发历史前先规范化成标准双语格式：即使模型上一次没写 ===（中文和日语混在
+      // 一段里），这里也用 splitBilingual 拆出来、重新拼成「[emotion]中文 === 日语」再发给它。
+      // 这样模型看到的历史永远是正确示范，不会越聊越跑偏。
+      const { zh, ja } = splitBilingual(m.content);
+      const emoMatch = String(m.content || "").match(/\[emotion:\s*(neutral|blush|angry|smile|sad)\s*\]/i);
+      const tag = emoMatch ? `[emotion:${emoMatch[1].toLowerCase()}]` : "";
+      if (isRecent) {
+        const normalized = ja ? `${tag}${zh}\n===\n${ja}` : `${tag}${zh}`;
+        return { role: m.role, content: clampBilingual(normalized, 600) || "（无内容）" };
+      }
+      return { role: m.role, content: clamp(zh, 200) || "（无内容）" };
     }
     if (m.hasImage) {
       const text = m.content || "";
-      return { role: m.role, content: text ? `[用户发过一张图片] ${clamp(text)}` : "[用户发过一张图片]" };
+      return { role: m.role, content: text ? `[用户发过一张图片] ${clamp(text, 300)}` : "[用户发过一张图片]" };
     }
-    return { role: m.role, content: clamp(m.content) };
+    return { role: m.role, content: clamp(m.content, 300) };
   });
 }
 
 /** 流式显示：实时提取可见文本（去 emotion 标签残片 + === 之后的日语段） */
 function streamingDisplay(raw) {
-  // 去所有 [emotion:xxx] 标签（含未完成残片 [emotion:xxx）
-  let t = String(raw || "").replace(/\[emotion:[^\]]*\]?/g, "");
-  // 兼容各种 === 分隔变体：取 === 之前的中文部分
-  const idx = t.indexOf("===");
-  if (idx !== -1) t = t.substring(0, idx);
-  return t.trim();
+  // 统一走 splitBilingual：模型不写 === 时也能把日语那几行切掉（流式期间同样别把日语显示出来）
+  return splitBilingual(raw).zh;
 }
 
 /** 更新已渲染消息的文本内容（流式逐字） */
@@ -1614,6 +1881,8 @@ async function sendMessage() {
         // 768：中文正文 + === + 日语段 双语输出，512 常被中文占满导致日语段截断（语音没日语可念→怪口音）
         max_tokens: 768,
         stream: true,
+        // 关掉小米默认开启的深度思考，否则要先吐一大段 reasoning 才出正文（"回复变慢"的元凶）
+        ...noThinking(cfg),
       }),
     });
 
@@ -1665,7 +1934,7 @@ async function sendMessage() {
       updateMessageText(row, "无回复");
     } else {
       updateMessageText(row, displayText(raw));
-      triggerEmotion(emotionOf(raw));
+      triggerEmotion(inferEmotion(raw));
       speakReply(raw); // 语音输出开启时：朗读回复 + 嘴唇同步（后台异步，不阻塞）
     }
     conversation.push({ role: "assistant", content: raw || "", ts: Date.now() });
@@ -1858,6 +2127,8 @@ function openPanel(mode) {
 
   renderProviderTabs(provider);
   renderModelSelect(provider);
+  updatePersonalityStatus(); // 设置面板显示人设加载状态
+  if (personalityCache === null) loadPersonality(); // 未加载则异步加载并刷新状态
   keyInput.value = STORE.key(provider);
   keyInput.type = "password";
   l2dToggle.checked = STORE.l2dEnabled;
@@ -2228,23 +2499,33 @@ async function httpGetAudioDataUrl(url) {
   });
 }
 
-/** TTS 合成（cosyvoice-v3.5-flash + 红莉栖复刻音色）→ 返回可播放 data URL */
-async function synthesizeSpeech(text) {
+/** TTS 合成（cosyvoice-v3.5-flash + 红莉栖复刻音色）→ 返回可播放 data URL。lang: "ja"，emotion 驱动语气 */
+async function synthesizeSpeech(text, lang, emotion) {
   const apiKey = loadAliyunKey().trim();
   if (!apiKey) throw new Error("未配置阿里云 API Key（设置 → 语音输出）");
   if (!ttsEnabled()) return null;
 
-  // 文本清洗（与桌面端一致）：先去（动作）括号（干扰韵律、可能报参数错误），再规整标点
-  // 省略号→句号、去波浪号、合并空白、末尾补句号（防末尾拖音）
+  // 文本清洗：只去掉会被念出来的「（动作）」括号，**不再抹平情绪标点**。
+  // 2026-10-27 修复"说话没感情"：旧清洗把省略号一律换成句号（……→。），
+  // 日语的迟疑、拖音、欲言又止全被改成四平八稳的陈述句，合成出来自然就是念稿腔。
+  // 现在省略号 → 顿号（短停顿，保留迟疑感），！？ 原样保留，只做重复标点去重。
   let t = text.replace(/[（(][^）)]*[）)]/g, "").replace(/\s+/g, " ").trim();
-  t = t.replace(/\.{3,}/g, "。").replace(/…/g, "。").replace(/。{2,}/g, "。");
-  t = t.replace(/~/g, "").replace(/〜/g, "");
+  t = t.replace(/[.．]{3,}/g, "、").replace(/…+/g, "、").replace(/・{2,}/g, "、");
+  t = t.replace(/、{2,}/g, "、").replace(/([。！？!?])\1+/g, "$1");
+  t = t.replace(/[~〜]/g, "");
   t = t.replace(/\s+/g, " ").trim();
-  if (t && !/[。！？!?\.]$/.test(t)) t += "。";
+  t = t.replace(/[、，,]+$/, ""); // 结尾不留悬空停顿（否则会出现拖长的尾音）
+  if (t && !/[。！？!?]$/.test(t)) t += "。";
   if (!t) return null;
 
+  // 硬规则（2026-10-26）：合成只允许日语。中文被日语发音规则念出来就是"怪腔调"，
+  // 宁可不念也不念错 —— 与电脑版"纯中文跳过 TTS"的策略一致。
+  if (lang !== "ja") {
+    console.warn("[TTS] 非日语文本，跳过合成（不允许用日语声线念中文）");
+    return null;
+  }
   const engine = loadTTSEngine();
-  return await synthesizeCosyVoice(t, apiKey, engine);
+  return await synthesizeCosyVoice(t, apiKey, engine, "ja", emotion);
 }
 
 /** TTS 错误 → 中文提示 */
@@ -2261,12 +2542,12 @@ function ttsErrorToZh(err) {
   return "语音输出失败：" + msg.slice(0, 80);
 }
 
-/** CosyVoice 合成（cosyvoice-v3.5-flash；带一次音色失效自愈重试） */
-async function synthesizeCosyVoice(text, apiKey, engine) {
+/** CosyVoice 合成（cosyvoice-v3.5-flash；带一次音色失效自愈重试）。lang: "ja" | "zh"，emotion 映射成 instruction */
+async function synthesizeCosyVoice(text, apiKey, engine, lang, emotion) {
   const model = engine || DEFAULT_TTS_ENGINE;
   let voice = await ensureCosyVoice(apiKey, model);
   try {
-    return await requestCosyVoiceAudio(text, apiKey, model, voice);
+    return await requestCosyVoiceAudio(text, apiKey, model, voice, lang, emotion);
   } catch (err) {
     // 音色失效（换过账号 / 音色被删 / 复刻尚未部署完成）→ 清缓存重新复刻一次再试
     if (/voice|音色|enroll|not.?found/i.test(String((err && err.message) || err))) {
@@ -2275,34 +2556,69 @@ async function synthesizeCosyVoice(text, apiKey, engine) {
       delete m[model];
       localStorage.setItem(COSYVOICE_VOICE_KEY, JSON.stringify(m));
       voice = await ensureCosyVoice(apiKey, model);
-      return await requestCosyVoiceAudio(text, apiKey, model, voice);
+      return await requestCosyVoiceAudio(text, apiKey, model, voice, lang, emotion);
     }
     throw err;
   }
 }
 
 /**
- * 发一次 CosyVoice 合成请求 → 可播放 dataURL。
- * 参数名按官方 HTTP API（cosyvoice-tts-http-api）：语速是 rate，不是 speech_rate。
- * language_hints 为目标语言（与复刻样本语言无关），数组只处理第一个元素。
+ * 情绪 → CosyVoice 合成指令（instruction）。
+ * 官方文档（非实时语音合成 / 指令控制）：CosyVoice 系列用 `instruction` 参数传自然语言指令，
+ * cosyvoice-v3.5-flash 的**复刻音色可输入任意指令**，长度上限 100 字符（汉字按 2 个字符计），
+ * 所以这里每条都压在 25 字以内。
+ *
+ * 2026-10-27 重写：旧文案是"声音放小""声音闷一点"这类**音量/音色**描述，
+ * 合成出来只会更小更平，听感反而更没感情。现在全部改成**表演动作**描述
+ * （什么心情、怎么说话、句子怎么断），让模型去演而不是去调音量。
+ * neutral 也传一条轻指令：不传时 CosyVoice 用默认平铺语气，就是用户说的"念稿"。
  */
-async function requestCosyVoiceAudio(text, apiKey, model, voice) {
-  const res = await httpPostJson(
-    "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
-    { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    {
-      model,
-      input: {
-        text,
-        voice,
-        format: "mp3",
-        sample_rate: 24000,
-        language_hints: ["ja"],
-        rate: 1.0,
-      },
+const EMOTION_INSTRUCTION = {
+  neutral: "像平常跟人聊天，语气自然有起伏，别念稿",
+  smile: "带着笑意说，语气上扬轻快，像忍不住笑出来",
+  angry: "被气到的口气，语速快、尾音上扬带刺，但别真凶",
+  blush: "心事被说中，慌乱又嘴硬，忽快忽慢，句尾发虚",
+  sad: "情绪低落，语速慢、句子之间留停顿，声音沉",
+};
+
+/** 发一次 CosyVoice 合成请求 → 可播放 dataURL。
+ * 参数名按官方 HTTP API（cosyvoice-tts-http-api）：语速是 rate，不是 speech_rate。
+ * language_hints 是「目标语言」，与复刻样本语言无关（数组只处理第一个元素）。
+ * instruction 控制情感/语气（CosyVoice 用 instruction，Qwen-TTS 才是 instructions）。
+ */
+async function requestCosyVoiceAudio(text, apiKey, model, voice, lang, emotion) {
+  const instruction = EMOTION_INSTRUCTION[emotion] || "";
+  const buildInput = (withInstruction) => {
+    const input = {
+      text,
+      voice,
+      format: "mp3",
+      sample_rate: 24000,
+      language_hints: [lang === "zh" ? "zh" : "ja"],
+      rate: 1.0,
+    };
+    if (withInstruction && instruction) input.instruction = instruction;
+    return input;
+  };
+  const post = (withInstruction) =>
+    httpPostJson(
+      "https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer",
+      { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      { model, input: buildInput(withInstruction) }
+    );
+
+  let res = await post(true);
+  let data = res.data || {};
+  // 保险：个别模型/音色组合可能不认 instruction（返回 400 参数错误）。
+  // 这种情况退回不带指令的请求，宁可语气平一点，也不能整条语音失效。
+  if ((!res.ok || data.error) && instruction) {
+    const msg = String(data.error?.message || data.error || res.rawText || "");
+    if (/instruction|invalid.?param|400|Unsupported/i.test(msg)) {
+      console.warn("[TTS] instruction 被拒，退回无指令合成:", msg.slice(0, 120));
+      res = await post(false);
+      data = res.data || {};
     }
-  );
-  const data = res.data || {};
+  }
   if (!res.ok || data.error) {
     const errMsg = data.error?.message || (data.error ? JSON.stringify(data.error) : res.rawText || `合成失败（HTTP ${res.status}）`);
     throw new Error(`cosyvoice: ${errMsg}`);
@@ -2387,14 +2703,97 @@ async function speakReply(raw) {
   if (vc) return; // 语音通话中跳过（通话有自己的 TTS 流程）
   try {
     if (!ttsEnabled() || !loadAliyunKey().trim()) return;
-    const ttsText = getTTSText(raw);
+    const { text: ttsText, lang } = getTTSText(raw);
     if (!ttsText) return;
-    const audioSrc = await synthesizeSpeech(ttsText);
+    const emotion = inferEmotion(raw); // 标签优先，没标签就从文字内容推断（驱动表情 + 语音语气）
+    let finalText = ttsText;
+    let finalLang = lang;
+    // 翻译兜底（2026-10-26）：模型没输出有效日语时，单独发一次翻译请求把中文段译成日语。
+    // 硬规则：宁可不出声，也绝不用日语声线念中文（用户的明确要求，与电脑版一致）。
+    if (lang === "zh") {
+      console.warn("[TTS] 模型未输出有效日语，走翻译兜底");
+      const ja = await translateToJapanese(ttsText);
+      if (!ja) {
+        console.warn("[TTS] 翻译兜底失败，本次跳过朗读（不会念中文）");
+        return;
+      }
+      finalText = ja;
+      finalLang = "ja";
+      console.log("[TTS] 翻译兜底成功，日语:", ja.slice(0, 60));
+      // 关键补救：把这句日语回填进会话历史，下一轮模型就能看到"双语示范"并自我强化，
+      // 避免每条回复都要翻译（历史是模型学习输出格式的主要来源）
+      try {
+        const last = [...conversation].reverse().find((m) => m.role === "assistant" && !m.summary);
+        if (last && !String(last.content || "").includes("===")) {
+          last.content = String(last.content || "").trim() + "\n===\n" + ja;
+          saveConversation();
+          console.log("[TTS] 已把日语回填到历史，修正格式示范");
+        }
+      } catch (e) {
+        console.warn("[TTS] 回填历史失败:", e);
+      }
+    }
+    const audioSrc = await synthesizeSpeech(finalText, finalLang, emotion);
     if (audioSrc) await vcPlayAudio(audioSrc);
   } catch (e) {
     console.warn("[TTS] 回复朗读失败:", e);
     // 聊天框显示中文错误 + 指引（不写入会话历史，仅提示）
     addMessage("assistant", `[语音输出] ${ttsErrorToZh(e)}`);
+  }
+}
+
+/**
+ * 翻译兜底：把中文文本译成红莉栖语气的自然日语口语。
+ * 复用当前对话供应商（小米 / DeepSeek）的 Key 与模型；非流式短请求。
+ * 返回 "" 表示失败（调用方回落中文朗读）。
+ */
+async function translateToJapanese(zhText) {
+  const cfg = currentConfig();
+  if (!cfg.apiKey) return "";
+  // 8 秒超时：网络抖动时不让用户一直干等（超时即放弃，本次不出声）
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const res = await fetch(`${cfg.endpoint}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是日语配音编剧。把用户给的中文改写成牧濑红莉栖（傲娇但内心温柔的天才少女）会**说出口**的日语台词，" +
+              "这段台词会被语音合成朗读，所以要写得能「演」出来。硬性要求：" +
+              "1) 必须是真日语：假名齐全、助词完整、动词变形正确，禁止把中文汉字照抄进来；" +
+              "2) 情绪强度必须保留：该喊就带 ！，该迟疑就带 ……，该小声就断成短句，" +
+              "禁止改写成四平八稳的书面语，也禁止加敬语把语气拉平；" +
+              "3) 用口语短句，允许口癖（あんた／ばか／別に／ったく／もう／ちょっと 等），" +
+              "句子之间用 、和 ！ 制造节奏，至少出现一个 ！ 或 ……；" +
+              "4) 长度与原文相当：不要扩写，也不要概括成一句；" +
+              "5) 只输出译文本身：不要解释、不要引号、不要任何中文。",
+          },
+          { role: "user", content: zhText },
+        ],
+        max_tokens: 400,
+        temperature: 0.3,
+        ...noThinking(cfg),
+      }),
+    });
+    if (!res.ok) return "";
+    const data = await res.json().catch(() => ({}));
+    let ja = String(data?.choices?.[0]?.message?.content || "").trim();
+    // 去掉模型偶尔加的引号包裹
+    ja = ja.replace(/^[「『"'“]+/, "").replace(/[」』"'”]+$/, "").trim();
+    // 必须含假名才算有效日语（防止模型把中文原样退回来）
+    if (!ja || !JA_KANA_RE.test(ja)) return "";
+    return ja;
+  } catch (e) {
+    console.warn("[TTS] 翻译兜底请求失败:", e);
+    return "";
   }
 }
 
@@ -2439,7 +2838,7 @@ async function sendProactiveMessage(instruction) {
   const res = await fetch(`${cfg.endpoint}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
-    body: JSON.stringify({ model: cfg.model, messages, max_tokens: 256, stream: false }),
+    body: JSON.stringify({ model: cfg.model, messages, max_tokens: 256, stream: false, ...noThinking(cfg) }),
   });
   if (!res.ok) return;
   const data = await res.json().catch(() => ({}));
@@ -2520,6 +2919,9 @@ function initProactiveIdleCheck() {
 
   // 图片按钮初始状态（跟随供应商：DeepSeek 不支持图）
   updateImageBtnState();
+
+  // 预热人设：避免首次主动消息时 system 提示里还没有人设，同时刷新设置面板的人设状态
+  loadPersonality();
 
   // 立绘开关初始状态
   applyL2DEnabled();
