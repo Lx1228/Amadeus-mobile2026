@@ -5,6 +5,10 @@
 > 本项目与桌面版（Electron/Tauri + 本地语音引擎）是**两个独立项目**，代码不共享，各自独立演进。
 > 桌面版追求本地离线与最高音质，手机版追求「随时打开就能聊」，所以语音走云端 API。
 
+## 下载
+
+最新安装包见 [Releases](https://github.com/Lx1228/Amadeus-mobile2026/releases/latest)（当前 v1.0.12）。
+
 ## 功能
 
 - **Live2D 立绘**：全屏立绘、触摸跟随、眨眼、呼吸、5 种情绪（neutral / blush / angry / smile / sad）
